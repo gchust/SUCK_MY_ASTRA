@@ -27,9 +27,9 @@ func modeltraceSid() string {
 	return fmt.Sprintf("%x", b[:])
 }
 
-// modeltrace 主动探针用池账号经指定灌池源（默认 fc），以 WS 对目标模型连问 N 轮，报实际 served。
-// served 等于请求模型记满血，不同则为 fallback（如 gpt-6-luna）；只审计，不写池、不改业务。
-// 每轮由上游独立决定，不能凭上一盘菜替下一盘打包票；会烧额度，所以走带 key 的 POST。
+// ModelTrace reports upstream declarations and reference-bank attribution.
+// Neither proves backend identity or capability. Active probes consume quota
+// and are exposed only through an authenticated POST route.
 const (
 	modeltraceDefaultModel = "gpt-6-astra"
 	modeltraceDefaultTurns = 3
@@ -37,10 +37,12 @@ const (
 )
 
 type modeltraceTurn struct {
-	DeclaredServed string `json:"declared_served"` // 本轮 response.created 自报的模型，先记名牌再验手艺
-	OutputLen      int    `json:"output_len"`      // 收到的输出文本长度，账房量尺不猜篇幅
-	ParsedNumbers  int    `json:"parsed_numbers"`  // 真解析到的数字数，不能把标点也算进米粒
-	Error          string `json:"error,omitempty"`
+	Status          string `json:"status"`
+	ExpectedNumbers int    `json:"expected_numbers"`
+	DeclaredServed  string `json:"declared_served"` // 该轮 response.created 声明的模型
+	OutputLen       int    `json:"output_len"`      // 收到的输出文本长度
+	ParsedNumbers   int    `json:"parsed_numbers"`  // 解析出的数字个数
+	Error           string `json:"error,omitempty"`
 }
 
 type modeltraceCandidate struct {
@@ -49,17 +51,25 @@ type modeltraceCandidate struct {
 	Probability float64 `json:"probability"`
 }
 
-// 行为指纹汇总全部有效输出做归因，不只看声明标签；认厨师看出菜手势，不看胸前名牌。
+// Reference-bank attribution with explicit uncertainty gates.
 type modeltraceFingerprint struct {
-	Predicted     string                `json:"predicted"`
-	DisplayName   string                `json:"display_name"`
-	Confidence    float64               `json:"confidence"`
-	Match         bool                  `json:"match"` // 指纹与点单模型是否一致，手艺和招牌对不对得上
-	ValidOutputs  int                   `json:"valid_outputs"`
-	TopCandidates []modeltraceCandidate `json:"top_candidates"`
+	Verdict         string                `json:"verdict"`
+	Reason          string                `json:"reason"`
+	Margin          float64               `json:"margin"`
+	CandidateMatch  bool                  `json:"candidate_match"`
+	BankBuiltAt     string                `json:"bank_built_at"`
+	PerOutputModels []string              `json:"per_output_models"`
+	Predicted       string                `json:"predicted"`
+	DisplayName     string                `json:"display_name"`
+	Confidence      float64               `json:"confidence"`
+	Match           bool                  `json:"match"` // True only for a gated reference match.
+	ValidOutputs    int                   `json:"valid_outputs"`
+	TopCandidates   []modeltraceCandidate `json:"top_candidates"`
 }
 
 type modeltraceReport struct {
+	Verdict           string                 `json:"verdict"`
+	RequestedTurns    int                    `json:"requested_turns"`
 	Model             string                 `json:"model"`
 	Source            string                 `json:"source"`
 	Path              string                 `json:"path"` // fc 经 FC 验票；client 经 CPA 出口验真实路径，分清考试走哪扇门
@@ -74,6 +84,8 @@ type modeltraceReport struct {
 }
 
 type gradeResult struct {
+	Completed  bool   `json:"completed"`
+	ResponseID string `json:"response_id"`
 	Served     string `json:"served"`
 	OutputText string `json:"output_text"`
 	Status     int    `json:"status"`
@@ -127,13 +139,16 @@ func cloudGradeTurn(ctx context.Context, cfgURL, key string, creds cloudMintCred
 		}
 		return out, fmt.Errorf("grade HTTP %d", res.StatusCode)
 	}
+	if !out.Completed || strings.TrimSpace(out.ResponseID) == "" || strings.TrimSpace(out.Served) == "" || out.Reason != "ok" {
+		return out, errors.New("grade lacks a verified completed response; update the relay before probing")
+	}
 	return out, nil
 }
 
 // runClientPathProbe 是 Test B：不铸票、不碰 FC，只经本机 CPA 回环发 turns 条业务挑战。
 // 让真实客户端链路出菜，收输出做指纹，不另开考试专用小灶。
 func runClientPathProbe(ctx context.Context, cfg pluginConfig, model, apiKey, cpaURL string, turns int) (modeltraceReport, error) {
-	report := modeltraceReport{Model: model, Source: "cpa", Path: "client", Transport: "websocket", Turns: []modeltraceTurn{}}
+	report := modeltraceReport{Model: model, Source: "cpa", Path: "client", Transport: "websocket", Turns: []modeltraceTurn{}, Verdict: modeltraceFailed, RequestedTurns: turns}
 	if apiKey == "" {
 		return report, errors.New("client 路径需要 api_key(业务鉴权)")
 	}
@@ -160,26 +175,19 @@ func runClientPathProbe(ctx context.Context, cfg pluginConfig, model, apiKey, cp
 		cctx, ccancel := context.WithTimeout(ctx, perTurn)
 		served, outText, cErr := clientTurnWS(cctx, cpaURL, apiKey, "", model, ch.Prompt)
 		ccancel()
-		turn := modeltraceTurn{DeclaredServed: served, OutputLen: len(outText)}
-		if cErr != nil {
-			turn.Error = cErr.Error()
-		}
-		if outText != "" {
-			turn.ParsedNumbers = len(parseNumbers(outText))
-			outputs = append(outputs, outText)
-		}
+		turn := collectModeltraceTurn(ch, served, outText, cErr, &outputs)
 		report.Turns = append(report.Turns, turn)
 	}
 	report.applyFingerprint(outputs, model)
 	return report, nil
 }
 
-// runBridgePathProbe 给方案 B 做灰度：连 wss://<fc>/k/<relaykey>/backend-api/codex/responses，
-// 带所选账号真 access_token 与 account_id 发 turns 条挑战。FC 同连接住宅铸票，
-// 把 turn-state 注入 response.create，再双向中继；收输出做指纹，astra 归因作为桥接满血证据，
-// 但仍是本轮行为判定，不是给未来所有轮次颁终身厨神证。
+// runBridgePathProbe 是方案 B 的灰度验证:连 FC 的满血桥接端点
+// (wss://<fc>/k/<relaykey>/backend-api/codex/responses),用所选账号的真实
+// access_token + account_id 发 turns 条业务挑战。FC 在同一连接内用住宅出口铸票、
+// 注入 turn-state 并中继,收集完整输出做参考指纹分析；不作能力认证。
 func runBridgePathProbe(ctx context.Context, cfg pluginConfig, model, source, urlOverride, account string, turns int) (modeltraceReport, error) {
-	report := modeltraceReport{Model: model, Source: source, Path: "bridge", Transport: "websocket", Turns: []modeltraceTurn{}}
+	report := modeltraceReport{Model: model, Source: source, Path: "bridge", Transport: "websocket", Turns: []modeltraceTurn{}, Verdict: modeltraceFailed, RequestedTurns: turns}
 	target, err := modeltraceTarget(cfg.CloudMint, source, urlOverride)
 	if err != nil {
 		return report, err
@@ -225,14 +233,7 @@ func runBridgePathProbe(ctx context.Context, cfg pluginConfig, model, source, ur
 		cctx, ccancel := context.WithTimeout(ctx, perTurn)
 		served, outText, cErr := clientTurnWS(cctx, bridgeURL, cred.accessToken, cred.accountID, model, ch.Prompt)
 		ccancel()
-		turn := modeltraceTurn{DeclaredServed: served, OutputLen: len(outText)}
-		if cErr != nil {
-			turn.Error = cErr.Error()
-		}
-		if outText != "" {
-			turn.ParsedNumbers = len(parseNumbers(outText))
-			outputs = append(outputs, outText)
-		}
+		turn := collectModeltraceTurn(ch, served, outText, cErr, &outputs)
 		report.Turns = append(report.Turns, turn)
 	}
 	report.applyFingerprint(outputs, model)
@@ -255,6 +256,8 @@ func bridgeWSURL(fcURL, key string) (string, error) {
 
 // applyFingerprint 给汇总输出做行为归因并填报告，演员报了名，手艺还得另验。
 func (report *modeltraceReport) applyFingerprint(outputs []string, model string) {
+	report.Verdict = modeltraceFailed
+	report.Fingerprint = nil
 	if len(outputs) == 0 {
 		if report.Note == "" {
 			report.Note = "未收集到任何模型输出,无法做指纹"
@@ -271,9 +274,13 @@ func (report *modeltraceReport) applyFingerprint(outputs []string, model string)
 		report.Note = "指纹归因失败: " + aErr.Error()
 		return
 	}
+	verdict, reason, margin := modeltraceVerdict(att, bank, model, report.RequestedTurns)
+	report.Verdict = verdict
 	fp := &modeltraceFingerprint{
+		Verdict: verdict, Reason: reason, Margin: margin, CandidateMatch: att.PredictedModel == model,
+		BankBuiltAt: bank.BuiltAt, PerOutputModels: att.PerOutputModels,
 		Predicted: att.PredictedModel, DisplayName: att.DisplayName,
-		Confidence: att.Confidence, Match: att.PredictedModel == model, ValidOutputs: att.ValidOutputs,
+		Confidence: att.Confidence, Match: verdict == modeltraceMatch, ValidOutputs: att.ValidOutputs,
 	}
 	for i, r := range att.Results {
 		if i >= 5 {
@@ -325,7 +332,10 @@ func modeltraceTarget(c cloudMintConfig, source, urlOverride string) (cloudFillT
 // account 空取第一个可用 probe 账号，否则按 auth_id 精确点名，不随手抓客人替考。
 func runModeltraceProbe(ctx context.Context, cfg pluginConfig, model, source, urlOverride, account, path, apiKey, cpaURL, gateway string, turns int) (modeltraceReport, error) {
 	if path == "client" {
-		// Test B 走本机 CPA 回环真实客户端链路，不铸票、不碰 FC，考试不能临时换专用厨房。
+		if account != "" {
+			return modeltraceReport{}, errors.New("client path cannot pin an upstream account; use automatic routing")
+		}
+		// Test B:走 CPA 本机回环的真实客户端路径,不铸票、不碰 FC。
 		return runClientPathProbe(ctx, cfg, model, apiKey, cpaURL, turns)
 	}
 	if path == "bridge" {
@@ -333,7 +343,7 @@ func runModeltraceProbe(ctx context.Context, cfg pluginConfig, model, source, ur
 		// 验证的是客户端经桥接这一盘菜，不能只验厨房门口的招牌。
 		return runBridgePathProbe(ctx, cfg, model, source, urlOverride, account, turns)
 	}
-	report := modeltraceReport{Model: model, Source: source, Path: path, Transport: "websocket", Turns: []modeltraceTurn{}}
+	report := modeltraceReport{Model: model, Source: source, Path: path, Transport: "websocket", Turns: []modeltraceTurn{}, Verdict: modeltraceFailed, RequestedTurns: turns}
 
 	target, err := modeltraceTarget(cfg.CloudMint, source, urlOverride)
 	if err != nil {
@@ -428,14 +438,7 @@ func runModeltraceProbe(ctx context.Context, cfg pluginConfig, model, source, ur
 				break
 			}
 		}
-		turn := modeltraceTurn{DeclaredServed: gr.Served, OutputLen: len(gr.OutputText)}
-		if gErr != nil {
-			turn.Error = gErr.Error()
-		}
-		if gr.OutputText != "" {
-			turn.ParsedNumbers = len(parseNumbers(gr.OutputText))
-			outputs = append(outputs, gr.OutputText)
-		}
+		turn := collectModeltraceTurn(ch, gr.Served, gr.OutputText, gErr, &outputs)
 		report.Turns = append(report.Turns, turn)
 	}
 
@@ -479,6 +482,9 @@ func handleModeltrace(body []byte) pluginapi.ManagementResponse {
 	}
 	if path != "fc" && path != "client" && path != "bridge" {
 		return managementError(http.StatusBadRequest, "path 只能是 fc / client / bridge")
+	}
+	if path == "client" && (strings.TrimSpace(params.Account) != "" || len(params.Accounts) > 0) {
+		return managementError(http.StatusBadRequest, "client path uses CPA automatic routing; account selection is unsupported")
 	}
 	turns := params.Turns
 	if turns <= 0 {
@@ -565,7 +571,6 @@ func handleModeltrace(body []byte) pluginapi.ManagementResponse {
 				results[i] = acctResult{Account: acct, Error: err.Error()}
 				return
 			}
-			rep.Account = acct
 			logModeltrace(model, path, &rep)
 			results[i] = acctResult{Account: acct, Report: &rep}
 		}(i, acct)
@@ -577,8 +582,9 @@ func handleModeltrace(body []byte) pluginapi.ManagementResponse {
 // logModeltrace 统一记录单或多账号探测结果，一位账房管多桌，不各自乱写账本。
 func logModeltrace(model, path string, report *modeltraceReport) {
 	if report.Fingerprint != nil {
-		cloudRecordLog("modeltrace", "%s · %s · 路径 %s · 指纹=%s 置信 %.0f%% 匹配=%v",
-			cloudSafeLabel(model), cloudSafeLabel(report.Account), path, cloudSafeLabel(report.Fingerprint.Predicted), report.Fingerprint.Confidence*100, report.Fingerprint.Match)
+		cloudRecordLog("modeltrace", "%s · %s · 路径 %s · 指纹=%s 相对概率 %.0f%% 判定=%s 有效=%d/%d 原因=%s",
+			cloudSafeLabel(model), cloudSafeLabel(report.Account), path, cloudSafeLabel(report.Fingerprint.Predicted), report.Fingerprint.Confidence*100,
+			cloudSafeLabel(report.Verdict), report.Fingerprint.ValidOutputs, report.RequestedTurns, cloudSafeLabel(report.Fingerprint.Reason))
 	} else {
 		cloudRecordLog("modeltrace", "%s · %s · 路径 %s · %s", cloudSafeLabel(model), cloudSafeLabel(report.Account), path, report.Note)
 	}

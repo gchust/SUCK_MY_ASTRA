@@ -56,9 +56,12 @@ type bankCalibration struct {
 }
 
 type modeltraceBank struct {
-	Models      []bankModel                `json:"models"`
-	Robust      bankRobust                 `json:"robust"`
-	Calibration map[string]bankCalibration `json:"calibration"`
+	BuiltAt            string                     `json:"built_at"`
+	RecommendedQueries int                        `json:"recommended_queries"`
+	DecisionPolicy     *modeltraceDecisionPolicy  `json:"decision_policy,omitempty"`
+	Models             []bankModel                `json:"models"`
+	Robust             bankRobust                 `json:"robust"`
+	Calibration        map[string]bankCalibration `json:"calibration"`
 }
 
 var (

@@ -1144,21 +1144,45 @@ function mintGradePayload(model, promptText, token) {
 // 累积 output_text.delta,记录 served 模型,读到终态即结束——攒到喊停为止。
 function wsGradeMessage(text, out, finish) {
   let event;
-  try { event = JSON.parse(text); } catch { return false; }
+  try { event = JSON.parse(text); } catch { finish({ reason: 'ws_invalid_json' }); return true; }
   const type = event?.type;
+  if (out.responseID && ((event?.response_id && event.response_id !== out.responseID)
+      || (event?.response?.id && event.response.id !== out.responseID))) {
+    finish({ reason: 'ws_response_id_changed' });
+    return true;
+  }
   if (type === 'response.output_text.delta') {
-    if (typeof event.delta === 'string') out.output += event.delta;
+    if (!out.responseID || typeof event.delta !== 'string') {
+      finish({ reason: 'ws_invalid_output_event' });
+      return true;
+    }
+    out.output += event.delta;
     return false;
   }
-  if (type === 'response.created' || type === 'response.in_progress') {
+  if (type === 'response.created') {
     const m = event.response?.model;
-    if (typeof m === 'string' && m) out.served = m;
+    const id = event.response?.id;
+    if (out.responseID || typeof m !== 'string' || !m.trim() || typeof id !== 'string' || !id.trim()) {
+      finish({ reason: 'ws_invalid_created_identity' });
+      return true;
+    }
+    out.served = m;
+    out.responseID = id;
     return false;
   }
-  if (type === 'response.completed' || type === 'response.incomplete') {
+  if (type === 'response.incomplete') {
+    finish({ reason: 'ws_incomplete' });
+    return true;
+  }
+  if (type === 'response.completed') {
     const m = event.response?.model;
-    if (typeof m === 'string' && m) out.served = m;
-    finish({ reason: 'ok' });
+    if (!out.responseID || event.response?.id !== out.responseID
+        || (m !== undefined && m !== out.served)
+        || (event.response?.status !== undefined && event.response.status !== 'completed')) {
+      finish({ reason: 'ws_invalid_completed_identity' });
+      return true;
+    }
+    finish({ reason: 'ok', completed: true });
     return true;
   }
   const error = mintEventError(text);
@@ -1262,10 +1286,11 @@ async function gradeTicket(req, res, cfg, entry, edgeIp) {
   entry.grade.reason = result.reason;
   entry.grade.served = result.served;
   entry.grade.output_len = (result.output || '').length;
-  const ok = result.reason === 'ok';
+  const ok = result.reason === 'ok' && result.completed === true;
   res.writeHead(ok ? 200 : 502, { 'content-type': 'application/json' });
   res.end(JSON.stringify({
     served: result.served || '', output_text: result.output || '',
+    completed: ok, response_id: result.responseID || '',
     status: result.status || 0, reason: result.reason || '',
   }));
 }
@@ -2418,6 +2443,6 @@ module.exports = {
     isPublicIP, keyMatches, filterRequestHeaders, filterResponseHeaders,
     mintGatewayLabel, mintGatewayTarget, createdModelFromSse, createdModelFromJson, mintPairs,
     fernetIssuedAt, parseModels, mintAttemptTrace, mintFingerprint, fireMintAttempt, mintWsClientFrame, readMintWsFrame,
-    fireWsGradeAttempt, mintGradePayload,
+    fireWsGradeAttempt, mintGradePayload, wsGradeMessage,
   },
 };

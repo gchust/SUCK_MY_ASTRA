@@ -64,7 +64,6 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -1024,6 +1023,7 @@ type pendingModelScanEntry struct {
 	steered bool
 	pairKey string
 	seenAt  time.Time
+	decoder *modelSSEDecoder
 }
 
 var pendingModelScans = struct {
@@ -1031,11 +1031,9 @@ var pendingModelScans = struct {
 	byID map[string]pendingModelScanEntry
 }{byID: make(map[string]pendingModelScanEntry)}
 
-// pendingModelScanMaxChunk 限扫描深度，response.created 通常首个 SSE 事件。
-// 这么多片还没 model 就结束观察，不让报幕员守到散场等一个从未报的名字。
-const pendingModelScanMaxChunk = 8
-
-// rememberModelScan 给请求设观察，沿用 pendingAuth 的 TTL 清扫；流没声明就结束的遗留项也有人收桌。
+// rememberModelScan arms the watch for one request. Entries are TTL'd by the
+// same sweep pendingAuth uses; a stream that ends without ever declaring a
+// model leaves one to be reclaimed there.
 func rememberModelScan(requestID, authID, model string, tsLen int, steered bool, pairKey string) {
 	if requestID == "" || authID == "" || model == "" {
 		return
@@ -1048,6 +1046,9 @@ func rememberModelScan(requestID, authID, model string, tsLen int, steered bool,
 			if now.Sub(entry.seenAt) > pendingAuthTTL {
 				delete(pendingModelScans.byID, key)
 			}
+		}
+		if len(pendingModelScans.byID) >= pendingAuthMax {
+			return
 		}
 	}
 	pendingModelScans.byID[requestID] = pendingModelScanEntry{
@@ -1076,21 +1077,13 @@ func dropModelScan(requestID string) {
 	pendingModelScans.mu.Unlock()
 }
 
-// noteServedModelChunk 每片只做轻量 map 查询，首个模型提取后结束观察。
-// 常规不取 state.mu，免得每条流每片都排引导锁；仅少见不匹配时取一次，黄牌要登记才去柜台。
+// Only a complete, identity-bearing response.created event settles a watch.
+// The decoder has a byte budget, and the existing request TTL bounds its life.
 func noteServedModelChunk(req pluginapi.StreamChunkInterceptRequest) {
 	if req.RequestID == "" {
 		return
 	}
-	if req.ChunkIndex > pendingModelScanMaxChunk {
-		dropModelScan(req.RequestID)
-		return
-	}
-	served, ok := servedModelFromChunk(req.Body)
-	if !ok {
-		return
-	}
-	entry, found := recallModelScan(req.RequestID)
+	entry, served, found := consumeModelScanChunk(req.RequestID, req.Body)
 	if !found {
 		return
 	}
@@ -1108,20 +1101,10 @@ func noteServedModelChunk(req pluginapi.StreamChunkInterceptRequest) {
 	}
 }
 
-// servedModelFromChunk 提取片段首个 model；Codex SSE 的 response.created 首先报模型，所以不用另解析事件名。
-// 字段若跨片，两边都会漏；开场约 1 KB 事件里这种情况少，这里不加尾缓冲，别把轻哨兵改成仓管。
+// Stateless helper for complete SSE fixtures; live traffic uses the per-request decoder.
 func servedModelFromChunk(body []byte) (string, bool) {
-	const needle = `"model":"`
-	i := bytes.Index(body, []byte(needle))
-	if i < 0 {
-		return "", false
-	}
-	rest := body[i+len(needle):]
-	j := bytes.IndexByte(rest, '"')
-	if j <= 0 {
-		return "", false
-	}
-	return string(rest[:j]), true
+	var decoder modelSSEDecoder
+	return decoder.feed(body)
 }
 
 // harvestFromResponse 喂全局池与观察账，绝不改响应；降级响应也可能带 pair，路过顺手收而不额外发请求。

@@ -334,6 +334,7 @@ type attributionReport struct {
 	Results         []modelAttribution `json:"results"`
 	ValidOutputs    int                `json:"valid_outputs"`
 	ParsedPerOutput []int              `json:"parsed_per_output"`
+	PerOutputModels []string           `json:"per_output_models"`
 }
 
 // analyzeOutputs 按若干输出文本给模型做行为归因，对应 analyze.rs::analyze_outputs，不看名牌看手艺。
@@ -353,8 +354,16 @@ func analyzeOutputs(texts []string, bank *modeltraceBank) (*attributionReport, e
 
 	modelCount := len(bank.Models)
 	allScores := make([][]float64, len(validNumbers))
+	perOutputModels := make([]string, len(validNumbers))
 	for i, nums := range validNumbers {
 		allScores[i] = robustScoreNumbers(nums, bank)
+		best := 0
+		for j := 1; j < modelCount; j++ {
+			if allScores[i][j] > allScores[i][best] {
+				best = j
+			}
+		}
+		perOutputModels[i] = bank.Models[best].ID
 	}
 	combined := make([]float64, modelCount)
 	for m := 0; m < modelCount; m++ {
@@ -393,5 +402,6 @@ func analyzeOutputs(texts []string, bank *modeltraceBank) (*attributionReport, e
 		Results:         results,
 		ValidOutputs:    len(validNumbers),
 		ParsedPerOutput: parsedCounts,
+		PerOutputModels: perOutputModels,
 	}, nil
 }

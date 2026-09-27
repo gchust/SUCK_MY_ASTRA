@@ -147,14 +147,12 @@ func wsWriteMasked(conn net.Conn, opcode byte, payload []byte) error {
 func wsCollectOutput(conn net.Conn, br *bufio.Reader) (served, output string, err error) {
 	var out strings.Builder
 	var frag []byte
+	var responseID string
 	total := 0
 	for {
 		fin, opcode, payload, rerr := wsReadServerFrame(br)
 		if rerr != nil {
-			if out.Len() > 0 {
-				return served, out.String(), nil
-			}
-			return served, out.String(), rerr
+			return served, out.String(), fmt.Errorf("stream ended before response.completed: %w", rerr)
 		}
 		total += len(payload)
 		if total > wsClientReadCap {
@@ -162,7 +160,7 @@ func wsCollectOutput(conn net.Conn, br *bufio.Reader) (served, output string, er
 		}
 		switch opcode {
 		case 0x8:
-			return served, out.String(), nil
+			return served, out.String(), errors.New("websocket closed before response.completed")
 		case 0x9:
 			_ = wsWriteMasked(conn, 0xA, payload)
 			continue
@@ -177,28 +175,41 @@ func wsCollectOutput(conn net.Conn, br *bufio.Reader) (served, output string, er
 			text := frag
 			frag = nil
 			var ev struct {
-				Type     string `json:"type"`
-				Delta    string `json:"delta"`
-				Response struct {
-					Model string `json:"model"`
+				Type       string `json:"type"`
+				Delta      string `json:"delta"`
+				ResponseID string `json:"response_id"`
+				Response   struct {
+					ID     string `json:"id"`
+					Model  string `json:"model"`
+					Status string `json:"status"`
 				} `json:"response"`
 			}
 			if json.Unmarshal(text, &ev) != nil {
-				continue
+				return served, out.String(), errors.New("invalid websocket event JSON")
+			}
+			if responseID != "" && ((ev.ResponseID != "" && ev.ResponseID != responseID) ||
+				(ev.Response.ID != "" && ev.Response.ID != responseID)) {
+				return served, out.String(), errors.New("websocket response ID changed")
 			}
 			switch ev.Type {
 			case "response.output_text.delta":
-				out.WriteString(ev.Delta)
-			case "response.created", "response.in_progress":
-				if ev.Response.Model != "" {
-					served = ev.Response.Model
+				if responseID == "" {
+					return served, out.String(), errors.New("output received before response.created")
 				}
-			case "response.completed", "response.incomplete":
-				if ev.Response.Model != "" {
-					served = ev.Response.Model
+				out.WriteString(ev.Delta)
+			case "response.created":
+				if responseID != "" || strings.TrimSpace(ev.Response.ID) == "" || strings.TrimSpace(ev.Response.Model) == "" {
+					return served, out.String(), errors.New("missing or duplicate response.created identity")
+				}
+				responseID, served = ev.Response.ID, ev.Response.Model
+			case "response.completed":
+				if responseID == "" || ev.Response.ID != responseID ||
+					(ev.Response.Model != "" && ev.Response.Model != served) ||
+					(ev.Response.Status != "" && ev.Response.Status != "completed") {
+					return served, out.String(), errors.New("invalid response.completed identity or status")
 				}
 				return served, out.String(), nil
-			case "response.failed", "error":
+			case "response.incomplete", "response.failed", "error":
 				return served, out.String(), fmt.Errorf("upstream %s", ev.Type)
 			}
 		}

@@ -196,14 +196,15 @@ func TestStreamedModelMismatchRecordsDowngrade(t *testing.T) {
 		ResponseHeaders: harvestResponseHeaders(fakeToken(780, wallClock())),
 	})
 
-	// 首个载荷块亮出回退模型名牌，替身到场。
-	streamChunk(t, pluginapi.StreamChunkInterceptRequest{
-		RequestID:  requestID,
-		Model:      "gpt-6-astra",
-		ChunkIndex: 0,
-		Body: []byte("event: response.created\n" +
-			`data: {"type":"response.created","response":{"id":"r1","model":"gpt-5.6-luna","status":"in_progress"}}` + "\n\n"),
-	})
+	// The first payload chunk declares the fallback model instead.
+	payload := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"r1","model": "gpt-5.6-luna","status":"in_progress"}}` + "\n\n"
+	for i := range payload {
+		streamChunk(t, pluginapi.StreamChunkInterceptRequest{
+			RequestID: requestID, Model: "gpt-6-astra", ChunkIndex: i,
+			Body: []byte(payload[i : i+1]),
+		})
+	}
 
 	cell := observedBucket(t, "codex-alpha.json", "gpt-6-astra")
 	if cell.NaturalLimited != 1 {
@@ -251,7 +252,7 @@ func TestStreamedModelMatchRecordsNothing(t *testing.T) {
 		RequestID:  requestID,
 		Model:      "gpt-5.5",
 		ChunkIndex: 0,
-		Body:       []byte(`data: {"type":"response.created","response":{"model":"gpt-5.5"}}`),
+		Body:       []byte(`data: {"type":"response.created","response":{"id":"r1","model":"gpt-5.5"}}` + "\n\n"),
 	})
 
 	cell := observedBucket(t, "codex-alpha.json", "gpt-5.5")
@@ -281,14 +282,14 @@ func TestStreamedChunkWithoutWatchIsIgnored(t *testing.T) {
 	}
 }
 
-// servedModelFromChunk 从 SSE 载荷摘第一个 model 字段，先看首张名牌。
+// Only complete, identity-bearing response.created events are evidence.
 func TestServedModelFromChunk(t *testing.T) {
 	for _, tc := range []struct {
 		body string
 		want string
 		ok   bool
 	}{
-		{`data: {"type":"response.created","response":{"model":"gpt-6-astra"}}`, "gpt-6-astra", true},
+		{`data: {"type":"response.created","response":{"id":"r1","model":"gpt-6-astra"}}` + "\n\n", "gpt-6-astra", true},
 		{`data: {"type":"response.created","response":{"model":""}}`, "", false},
 		{`data: {"type":"response.output_text.delta","delta":"hi"}`, "", false},
 		{"", "", false},

@@ -31,8 +31,8 @@ type gatewaySweepReport struct {
 	Model    string              `json:"model"`
 	Rounds   int                 `json:"rounds"`
 	Gateways []gatewaySweepEntry `json:"gateways"`
-	Best     string              `json:"best"`      // 满血率最高的网关，本轮席上的头名
-	BestNote string              `json:"best_note"` // 固定网关的建议，给配置抄门牌用
+	Best     string              `json:"best"`      // Reference-match candidate, not a capability guarantee.
+	BestNote string              `json:"best_note"` // Routing recommendation for this probe batch.
 }
 
 func handleGatewaySweep(body []byte) pluginapi.ManagementResponse {
@@ -98,7 +98,7 @@ func handleGatewaySweep(body []byte) pluginapi.ManagementResponse {
 		e.Rounds++
 		if rep.Fingerprint != nil {
 			e.Predictions[rep.Fingerprint.Predicted]++
-			if rep.Fingerprint.Match {
+			if rep.Verdict == modeltraceMatch && rep.Fingerprint.Match {
 				e.FullStrength++
 			}
 		} else {
@@ -128,7 +128,7 @@ func handleGatewaySweep(body []byte) pluginapi.ManagementResponse {
 		}
 	}
 	if report.Best == "" {
-		report.BestNote = "本次扫描未见任何网关满血(可能是出口/传输问题,不是网关选择问题)"
+		report.BestNote = "本次没有满足指纹判定条件的候选；检查完整性、有效样本及经验证的判定策略，不代表网关能力差"
 	}
 	cloudRecordLog("gateway-sweep", "%s · %d 轮 · 满血网关=%s", cloudSafeLabel(model), rounds, cloudSafeLabel(report.Best))
 	return jsonResponse(http.StatusOK, report)
